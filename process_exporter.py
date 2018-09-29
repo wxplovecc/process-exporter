@@ -7,6 +7,7 @@ import re
 import os
 import socket
 import yaml
+from threading import Thread
 
 from prometheus_client import start_http_server
 from prometheus_client.core import GaugeMetricFamily, REGISTRY
@@ -24,6 +25,51 @@ def quit_script(msg, exit_code):
     sys.exit(exit_code)
 
 
+class CollectThread(Thread):
+    def __init__(self, id, pid, metric):
+        Thread.__init__(self)
+        self.id = id
+        self.name = id + "test"
+        self.pid = pid
+        self.metric = metric
+
+    def run(self):
+        self.get_process_metrics()
+
+    def get_process_metrics(self):
+        '''
+        This function is setup to scrape process metrics, such as CPU, Mem, uptime, status and so on.
+        All the metrics can be scraped in the /proc/pid/stat file. However, here I uesed a third-party liberary "psutil"
+        to get all data I need.
+        @pid: PID get by get_pid() function.
+        @return: return a dict of all metrics I need.
+        '''
+        process_metrics = {}
+        try:
+            process = psutil.Process(int(self.pid))
+            cmdline = process.cmdline()
+            process_metrics = {
+                "create_time": process.create_time(),
+                # "io_counters": process.io_counters()._asdict(),
+                "cpu_times": process.cpu_times()._asdict(),
+                "memory_percent": process.memory_percent(),
+                "memory_info": process.memory_info()._asdict(),
+                # "num_fds": process.num_fds()
+                "num_threads": process.num_threads(),
+                "cwd": process.cwd(),
+                "cmdline": cmdline[-1],
+                "exe": process.exe(),
+                "cpu_percent": process.cpu_percent(interval=1),
+                "pid": str(process.pid)
+                # "open_files": len(process.open_files())
+            }
+        except Exception, err:
+            logging.error("No pid {0} found, please check ! ".format(err))
+            print 1, err
+            pass
+        self.metric[self.id] = process_metrics
+
+
 class ProcessCollector(object):
     def __init__(self, config_file):
         try:
@@ -33,92 +79,121 @@ class ProcessCollector(object):
             quit_script(str(e), 1)
 
     def collect(self):
-        hostname = socket.gethostname()
-        # allCpu
+        try:
+            hostname = socket.gethostname()
+            # allCpu
+            allCpu = GaugeMetricFamily(
+                'offline_machine_cpu_percentage',
+                'machine cpu percentage',
+                labels=['host'])
+            allCpu.add_metric([hostname], value=psutil.cpu_percent())
+            yield allCpu
 
-        allCpu = GaugeMetricFamily(
-            'offline_machine_cpu_percentage',
-            'machine cpu percentage',
-            labels=['host'])
-        allCpu.add_metric([hostname], value=psutil.cpu_percent())
-        yield allCpu
+            # all mem
+            allMem = GaugeMetricFamily(
+                'offline_machine_mem_percentage',
+                'machine mem percentage',
+                labels=['host'])
+            allMem.add_metric([hostname],
+                              value=psutil.virtual_memory().percent)
+            yield allMem
 
-        # all mem
-        allMem = GaugeMetricFamily(
-            'offline_machine_mem_percentage',
-            'machine mem percentage',
-            labels=['host'])
-        allMem.add_metric([hostname], value=psutil.virtual_memory().percent)
-        yield allMem
+            # all disk
+            allDisk = GaugeMetricFamily(
+                'offline_machine_disk_percentage',
+                'machine disk percentage',
+                labels=['host'])
+            allDisk.add_metric([hostname],
+                               value=psutil.disk_usage('/').percent)
+            yield allDisk
 
-        # all disk
-        allDisk = GaugeMetricFamily(
-            'offline_machine_disk_percentage',
-            'machine disk percentage',
-            labels=['host'])
-        allDisk.add_metric([hostname], value=psutil.disk_usage('/').percent)
-        yield allDisk
+            process_names = self.config['check_processes']
+            for process_name in process_names:
+                print 'process_name = %s ' % (process_name)
 
-        process_names = self.config['check_processes']
-        for process_name in process_names:
-            print 'process_name = %s ' % (process_name)
-            for process in get_pid(process_name):
-                snake_case = re.sub('[-|\s]', r'_', process_name).lower()
-                process_metrics = get_process_metrics(process['pid'],
-                                                      process['name'])
+                allProcess = get_pid(process_name)
 
-                if process_metrics:
-                    runningTime = GaugeMetricFamily(
-                        'offline_process_running_time_seconds_total',
+                metrics = {}
+
+                ThreadList = []
+                for i, value in enumerate(allProcess):
+                    t = CollectThread(str(i), value['pid'], metrics)
+                    ThreadList.append(t)
+                for t in ThreadList:
+                    t.start()
+                for t in ThreadList:
+                    t.join()
+
+                for key, process_metrics in metrics.iteritems():
+
+                    snake_case = process_name.lower()
+                    process_count = GaugeMetricFamily(
+                        'offline_process_count',
                         snake_case + ' Total Running time in seconds.',
                         labels=['pid', 'exe', 'cmd', 'host'])
-                    runningTime.add_metric(
-                        [
-                            process_metrics['pid'], process_name,
-                            process_metrics['cmdline'], hostname
-                        ],
-                        value=process_metrics['create_time'])
-                    yield runningTime
-                    # cpu
-                    cpu = GaugeMetricFamily(
-                        'offline_process_cpu_percentage',
-                        snake_case + ' CPU Percentage.',
-                        labels=['pid', 'exe', 'cmd', 'host'])
-                    cpu.add_metric([
+                    process_count.add_metric([
                         process_metrics['pid'], process_name,
                         process_metrics['cmdline'], hostname
                     ],
-                                   value=process_metrics['cpu_percent'])
-                    yield cpu
+                                             value=1)
+                    yield process_count
 
-                    # mempersent
-                    mempersent = GaugeMetricFamily(
-                        'offline_process_mem_percentage',
-                        snake_case + ' mem Percentage.',
-                        labels=['pid', 'exe', 'cmd', 'host'])
-                    mempersent.add_metric(
-                        [
+                    if process_metrics:
+                        runningTime = GaugeMetricFamily(
+                            'offline_process_running_time_seconds_total',
+                            snake_case + ' Total Running time in seconds.',
+                            labels=['pid', 'exe', 'cmd', 'host'])
+                        runningTime.add_metric(
+                            [
+                                process_metrics['pid'], process_name,
+                                process_metrics['cmdline'], hostname
+                            ],
+                            value=process_metrics['create_time'])
+                        yield runningTime
+                        # cpu
+                        cpu = GaugeMetricFamily(
+                            'offline_process_cpu_percentage',
+                            snake_case + ' CPU Percentage.',
+                            labels=['pid', 'exe', 'cmd', 'host'])
+                        cpu.add_metric([
                             process_metrics['pid'], process_name,
                             process_metrics['cmdline'], hostname
                         ],
-                        value=process_metrics['memory_percent'])
-                    yield mempersent
+                                       value=process_metrics['cpu_percent'])
+                        yield cpu
 
-                    threadCount = GaugeMetricFamily(
-                        'offline_process_threads_number',
-                        snake_case + ' Total Number of Threads.',
-                        labels=['pid', 'exe', 'cmd', 'host'])
-                    threadCount.add_metric(
-                        [
-                            process_metrics['pid'], process_name,
-                            process_metrics['cmdline'], hostname
-                        ],
-                        value=process_metrics['num_threads'])
+                        # mempersent
+                        mempersent = GaugeMetricFamily(
+                            'offline_process_mem_percentage',
+                            snake_case + ' mem Percentage.',
+                            labels=['pid', 'exe', 'cmd', 'host'])
+                        mempersent.add_metric(
+                            [
+                                process_metrics['pid'], process_name,
+                                process_metrics['cmdline'], hostname
+                            ],
+                            value=process_metrics['memory_percent'])
+                        yield mempersent
 
-                    yield threadCount
+                        threadCount = GaugeMetricFamily(
+                            'offline_process_threads_number',
+                            snake_case + ' Total Number of Threads.',
+                            labels=['pid', 'exe', 'cmd', 'host'])
+                        threadCount.add_metric(
+                            [
+                                process_metrics['pid'], process_name,
+                                process_metrics['cmdline'], hostname
+                            ],
+                            value=process_metrics['num_threads'])
 
-                else:
-                    pass
+                        yield threadCount
+
+                    else:
+                        pass
+        except Exception, err:
+            print 1, err
+        finally:
+            pass
 
 
 def get_pid(process_name):
@@ -140,41 +215,6 @@ def get_pid(process_name):
     #     for p in psutil.process_iter(attrs=['pid', 'name', 'cmdline', 'exe'])
     #     if process_name in p['exe']
     # ]
-
-
-def get_process_metrics(pid, process_name):
-    '''
-    This function is setup to scrape process metrics, such as CPU, Mem, uptime, status and so on.
-    All the metrics can be scraped in the /proc/pid/stat file. However, here I uesed a third-party liberary "psutil"
-    to get all data I need.
-    @pid: PID get by get_pid() function.
-    @return: return a dict of all metrics I need.
-    '''
-    process_metrics = {}
-    try:
-        process = psutil.Process(int(pid))
-        cmdline = process.cmdline()
-        process.cpu_percent(interval=None)
-        process_metrics = {
-            "create_time": process.create_time(),
-            # "io_counters": process.io_counters()._asdict(),
-            "cpu_times": process.cpu_times()._asdict(),
-            "cpu_percent": process.cpu_percent(interval=None),
-            "memory_percent": process.memory_percent(),
-            "memory_info": process.memory_info()._asdict(),
-            # "num_fds": process.num_fds()
-            "num_threads": process.num_threads(),
-            "cwd": process.cwd(),
-            "cmdline": cmdline[-1],
-            "exe": process.exe(),
-            "pid": str(process.pid)
-            # "open_files": len(process.open_files())
-        }
-    except Exception, err:
-        logging.error("No pid {0} found, please check ! ".format(err))
-        print 1, err
-        pass
-    return process_metrics
 
 
 def main():
